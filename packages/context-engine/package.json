@@ -1,0 +1,26 @@
+{
+  "name": "@context/engine",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx src/__test__/reversible-advanced.test.ts && tsx src/__test__/engine-policy.test.ts && tsx src/__test__/engine-summarize.test.ts && tsx src/__test__/engine-hysteresis.test.ts && tsx src/__test__/module-tracker.test.ts && tsx src/__test__/archive-store.test.ts && tsx src/__test__/archive-retriever.test.ts && tsx src/__test__/engine-archive.test.ts && tsx src/__test__/hybrid-search.test.ts && tsx src/__test__/anthropic.test.ts && tsx src/__test__/repo-map.test.ts && tsx src/__test__/pagerank.test.ts",
+    "benchmark": "tsx src/__test__/benchmark.ts"
+  },
+  "dependencies": {
+    "gpt-tokenizer": "^2.5.0",
+    "web-tree-sitter": "^0.25.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "tree-sitter-javascript": "^0.23.0"
+  }
+}

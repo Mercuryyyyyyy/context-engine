@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+.DS_Store
+coverage/
+.vscode/
+.idea/
+*.tsbuildinfo
+
+# tooling caches & local state
+.pnpm-store/
+.agents/
+
+# internal docs (kept local, not for public repo)
+*.docx
+RESUME_INTERVIEW_PREP.md
+线上面试展示方式.md
+context-interview-qa/
