@@ -1,10 +1,92 @@
-// context-mcp - MCP server 占位
-// P3 阶段实现：将 context-engine 的检索/压缩能力作为 MCP server 暴露
-// 届时引入 @modelcontextprotocol/sdk，注册以下工具：
-//   - get_repo_map: 返回 tree-sitter repo map
-//   - compress_context: 对给定文本做可逆压缩
-//   - estimate_cache: 预估缓存命中率
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import {
+  ArchiveStore,
+  type RetrievedContext,
+} from '@context/engine';
 
-console.log('context-mcp v0.1.0');
-console.log('MCP server 占位，待 P3 阶段实现。');
-console.log('将暴露 context-engine 的检索/压缩能力给 MCP 客户端。');
+export interface SearchArchiveResult {
+  query: string;
+  results: Array<{
+    id: string;
+    content: string;
+    score?: number;
+    metadata?: Record<string, unknown>;
+  }>;
+}
+
+function toSearchResult(result: RetrievedContext): SearchArchiveResult['results'][number] {
+  return {
+    id: result.id,
+    content: result.content,
+    score: result.score,
+    metadata: result.metadata,
+  };
+}
+
+/**
+ * Create an MCP server backed by an existing ArchiveStore.
+ *
+ * The store is injected so an embedding application can expose the same
+ * in-memory archive used by the engine instead of creating a disconnected copy.
+ */
+export function createMcpServer(store: ArchiveStore): McpServer {
+  const server = new McpServer({
+    name: 'context-engine',
+    version: '0.1.0',
+  });
+
+  server.registerTool(
+    'search_archive',
+    {
+      title: 'Search archived context',
+      description:
+        'Search archived conversation messages with the Context Engine archive index.',
+      inputSchema: {
+        query: z.string().trim().min(1).describe('Natural-language search query'),
+        topK: z.number().int().min(1).max(20).default(6).describe('Maximum results'),
+      },
+    },
+    async ({ query, topK }) => {
+      const results = await store.search(query, topK);
+      const payload: SearchArchiveResult = {
+        query,
+        results: results.map(toSearchResult),
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(payload, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  return server;
+}
+
+/**
+ * Start the standalone stdio server.
+ *
+ * A standalone process has its own ArchiveStore. Embedding applications should
+ * call createMcpServer() with their live store instead.
+ */
+export async function startStdioServer(store = new ArchiveStore()): Promise<void> {
+  const server = createMcpServer(store);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('context-mcp listening on stdio');
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  startStdioServer().catch((error: unknown) => {
+    console.error('context-mcp failed to start:', error);
+    process.exitCode = 1;
+  });
+}

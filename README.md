@@ -38,7 +38,7 @@
 |---|---|
 | `@context/engine` | 核心算法：分层、归档、检索、压缩瀑布、缓存优化、预算管理 |
 | `@context/proxy` | HTTP 代理：OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` 双协议拦截，**输入改写、输出透传** |
-| `@context/mcp` | MCP 扩展层（P3 预留，尚未实现） |
+| `@context/mcp` | MCP server：通过 stdio 暴露 `search_archive` |
 
 ## 引擎五步管线
 
@@ -77,7 +77,7 @@ packages/
 │       ├── cache.ts       # 命中率预估（逐条 + token 级前缀匹配）
 │       └── __test__/      # 12 个测试套件 + benchmark + accuracy-eval
 ├── context-proxy/         # Hono 双协议代理 + demo 客户端
-└── context-mcp/           # MCP 扩展层（占位）
+└── context-mcp/           # MCP server（search_archive）
 ```
 
 ## 更多文档
@@ -86,9 +86,20 @@ packages/
 - [PROJECT_STATUS.md](./PROJECT_STATUS.md) —— 工程状态与里程碑
 - [reports/](./reports) —— 基准测试、消融实验与评测报告
 
+## MCP 使用
+
+`@context/mcp` 通过 stdio 暴露 `search_archive` 工具。本阶段采用独立进程模式，启动时使用空的内存归档；它不会自动读取 `context-proxy` 的实时 session：
+
+```bash
+pnpm --filter @context/mcp build
+node packages/context-mcp/dist/index.js
+```
+
+未来宿主应用若已有实时归档状态，可调用 `createMcpServer(archiveStore)` 复用同一个 `ArchiveStore`。这属于后续集成方向，本阶段不包含代理 session 生命周期接入。
+
 ## 路线图
 
 - [x] 双协议代理 + 压缩瀑布 + 缓存优化
 - [x] ArchiveStore 归档召回 + tree-sitter repo map
-- [ ] context-mcp：将归档检索能力封装为 MCP server（进行中）
+- [x] context-mcp：将归档检索能力封装为 MCP server（`search_archive`）
 - [ ] 评测基准脚本开源整理 + 英文 README

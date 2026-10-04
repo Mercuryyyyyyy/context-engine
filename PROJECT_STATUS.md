@@ -142,7 +142,7 @@ f:\Context\
     │   │   ├── index.ts         # CLI 入口
     │   │   └── demo-client.ts   # demo 对话脚本
     │   └── package.json
-    └── context-mcp/             # MCP server（P3 占位）
+    └── context-mcp/             # MCP server（search_archive）
         ├── src/
         │   └── index.ts         # 占位
         └── package.json
@@ -154,7 +154,7 @@ f:\Context\
 | ---- | ----------------- | ----------------- | -------------------------- |
 | 核心库  | `@context/engine` | npm 包             | 核心算法：检索 / 压缩 / 缓存 / 预算     |
 | 代理层  | `@context/proxy`  | CLI + HTTP server | 拦截并改写 messages，转发到 LLM API |
-| 生态接入 | `@context/mcp`    | MCP server（占位）    | 暴露检索能力给 MCP 生态             |
+| 生态接入 | `@context/mcp`    | MCP server            | 通过 `search_archive` 暴露 ArchiveStore 检索 |
 
 ## 四、已实现功能详解
 
@@ -504,7 +504,11 @@ pnpm --filter @context/engine exec tsx src/__test__/benchmark.ts
 
 ### context-mcp
 
-- `@modelcontextprotocol/sdk`（P3 占位，未实现）
+- 已实现 `search_archive` MCP tool：复用注入的 `ArchiveStore`，支持 `query` 与 `topK` 参数。
+- 默认入口使用 stdio transport；服务日志写 stderr，stdout 保持 MCP 协议干净。
+- `createMcpServer(store)` 保留为未来宿主接入接口；当前独立 stdio 模式不接入代理 session 生命周期，也不伪造实时归档数据。
+
+- `@modelcontextprotocol/sdk` + `zod`：MCP 协议、stdio transport 与工具参数校验。
 
 ## 七、已完成阶段
 
@@ -542,7 +546,7 @@ pnpm --filter @context/engine exec tsx src/__test__/benchmark.ts
 
 - P3-4: 本地 mock 上游（网络兜底）
 - P3-5: 运行时配置切换（`/config` PATCH 端点）
-- MCP server 包装
+- ~~MCP server 包装~~ 已完成：`search_archive`
 - npm 发布
 
 ## 八、待解决问题与下一步工作
@@ -574,7 +578,7 @@ pnpm --filter @context/engine exec tsx src/__test__/benchmark.ts
 2. **面试展示 Benchmark 报告**：独立一份（`reports/BENCHMARK_FINAL.md` 已有），补充"典型案例解剖"章节（选 1-2 轮展示压缩前后具体内容），非每次运行生成
 3. **P3-4: 本地 mock 上游**：网络断了也能 demo，准备预设回答的假 LLM server
 4. **P3-5: 运行时配置切换**：`/config` PATCH 端点，不重启代理改 budget / 策略
-5. **MCP server 包装**：P3 生态接入
+5. **MCP server 扩展**：补充归档持久化与宿主应用接入
 6. **npm 发布**：让面试官能 `npm install` 试
 
 ## 九、关键设计决策记录
