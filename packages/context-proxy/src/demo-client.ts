@@ -32,6 +32,16 @@ const MODEL = 'deepseek-chat';
 //   EMBED_BASE_URL  embedding API base URL（默认 https://api.openai.com）
 //   EMBED_MODEL     embedding 模型（默认 text-embedding-3-small）
 const EMBED_API_KEY = process.env.EMBED_API_KEY || '';
+
+// rotation 经济性门槛（由 --rotation-ratio 设置，默认 0 = 关闭）。
+// 硬约束兜底 --rotation-force-tokens：total 达到该值时忽略门槛强制 rotation（0 = 关闭）。
+// runConversation 已有大量位置参数，用模块级变量承接 CLI 配置，避免改动全部调用点。
+let ROTATION_MIN_SAVINGS_RATIO = 0;
+let ROTATION_FORCE_TOKENS = 0;
+// 模型上下文窗口上限（由 --context-window 设置，0 = 不推导硬约束阈值）。
+let CONTEXT_WINDOW_TOKENS = 0;
+// 为输出预留的 token（= --max-output，用于自动推导硬约束阈值）。
+let RESERVE_OUTPUT_TOKENS = 0;
 const EMBED_BASE_URL = process.env.EMBED_BASE_URL || 'https://api.openai.com';
 const EMBED_MODEL = process.env.EMBED_MODEL || 'text-embedding-3-small';
 
@@ -574,7 +584,7 @@ async function runConversation(
   const useHybridRetrieval = ablationMode === 'C';
   const moduleTracker = new ModuleTracker({
     topicSwitchThreshold: 0.20,
-    archiveDelayRounds: 3,
+    archiveDelayRounds: 8,
     highWatermarkTokens: budget > 0 ? budget * 1.5 : 10000,
   });
   // 消融模式 B/C：B 不用 embedFn（纯 BM25），C 用 embedFn（混合检索）
@@ -595,6 +605,7 @@ async function runConversation(
   let prevMessages: Message[] | undefined; // 上一轮的 messages（用于缓存命中预估）
   let prevDurableMessages: Message[] | undefined;
   let prevRawMessages: Message[] | undefined;
+  let stablePrefixTurns = 0;
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i]!;
@@ -625,14 +636,23 @@ async function runConversation(
         enableReversible: true,
         enableSemanticFold,
         previousMessages: canReuseEpoch ? prevMessages : undefined,
-        // Compaction Epoch：传入稳定前缀长度，保护上一轮压缩后的前缀不被再次压缩。
-        // 这样未超硬上限（highWatermark*1.5）时前缀逐字不变，Provider 缓存可命中。
+        // Compaction Epoch：传入稳定前缀及其持续轮数，延迟破坏 Provider 前缀缓存的轮换。
         stablePrefixLength: canReuseEpoch ? prevDurableMessages!.length : 0,
+        stablePrefixTurns: canReuseEpoch ? stablePrefixTurns : 0,
         // Compaction hysteresis：高水位=budget 触发，低水位=budget*0.7 目标
         // 一次压缩释放足够空间支撑数轮追加，避免每轮频繁触发破坏前缀稳定性
         compaction: budget > 0 ? {
           highWatermark: budget,
           lowWatermark: Math.floor(budget * 0.7),
+          rotationAfterRounds: 6,
+          // rotation 经济性门槛：0 = 关闭（既有行为）
+          rotationMinSavingsRatio: ROTATION_MIN_SAVINGS_RATIO,
+          // 硬约束兜底：0 = 关闭。上下文逼近窗口上限时忽略门槛强制 rotation。
+          rotationForceTokens: ROTATION_FORCE_TOKENS,
+          // 提供窗口上限时，由 engine 自动推导 rotationForceTokens（显式阈值优先）。
+          contextWindowTokens: CONTEXT_WINDOW_TOKENS,
+          // 为输出预留空间，从可用输入空间中扣除
+          reserveOutputTokens: RESERVE_OUTPUT_TOKENS,
         } : undefined,
         // 归档系统：消融模式 A 不传 archive，B/C 传 archive
         ...(useArchive && archiveStore && archiveRetriever ? {
@@ -669,10 +689,20 @@ async function runConversation(
         archivedModules: engineResult.stats.archivedModules ?? 0,
         archivedMessages: engineResult.stats.archivedMessages ?? 0,
       };
+      const previousDurableMessages = prevDurableMessages;
       // 更新 prevMessages 为压缩后的 messages（用于下一轮的缓存命中预估）
       prevMessages = engineResult.messages;
       prevDurableMessages = engineResult.messages.filter((message) => message.name !== 'context-retrieval');
       prevRawMessages = structuredClone(history);
+      if (canReuseEpoch && previousDurableMessages) {
+        const currentPrefix = prevDurableMessages.slice(0, previousDurableMessages.length);
+        const prefixChanged = currentPrefix.length !== previousDurableMessages.length
+          || previousDurableMessages.some((message, index) =>
+            JSON.stringify(message) !== JSON.stringify(currentPrefix[index]));
+        stablePrefixTurns = prefixChanged ? 0 : stablePrefixTurns + 1;
+      } else {
+        stablePrefixTurns = 0;
+      }
       if (process.env.DIAG) {
         console.log(`  ${C.magenta}[DIAG]${C.reset} strategies: [${engineResult.stats.strategies.join(', ')}], output.len=${engineResult.messages.length}, optimized=${engineResult.stats.optimizedTokens}tok, original=${engineResult.stats.originalTokens}tok`);
         const outPreview = engineResult.messages.slice(0, 5).map((m, idx) => `[${idx}]${m.role}${m.name ? '/'+m.name : ''}:${typeof m.content === 'string' ? m.content.length+'ch' : 'non-str'}`);
@@ -768,34 +798,60 @@ async function judgeCall(
   question: string,
   answerA: string,
   answerB: string,
-  forceChoice: boolean = false,
-): Promise<JudgeVerdict> {
-  const systemPrompt = forceChoice
-    ? `You are an impartial judge. Compare two answers to the same question.
-Evaluate on correctness, completeness of required information, and faithfulness to the question.
-Do NOT favor longer answers, and ignore differences in wording, formatting, or code style.
-You MUST pick A or B, cannot say tie. Output ONLY "A" or "B".`
-    : `You are an impartial judge. Compare two answers to the same question.
-Evaluate on correctness, completeness of required information, and faithfulness to the question.
-Do NOT favor longer answers, and ignore differences in wording, formatting, or code style.
-Output ONLY "A", "B", or "tie". A is better → "A", B is better → "B", equally good → "tie".`;
+): Promise<{ verdict: JudgeVerdict; reason: string }> {
+  // 评测口径（2026-10-07 修正）：
+  // 旧 prompt 只说"不要偏好长答案"，但评判标准仍是泛泛的 "completeness"——
+  // 更长的答案天然显得更完整，导致 Judge 在相似度 88% 时仍稳定判原始更好（实测 0 胜 1 平 4 负）。
+  // 改为"需求逐条核对"：只有事实错误、或某条需求仅一方满足，才分出优劣；
+  // 篇幅/补充内容/技术选型差异显式列为必须判 tie 的情形。
+  const requirements = extractRequirements(question);
+  const reqBlock = requirements.length > 0
+    ? `\nStated requirements to check:\n${requirements.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n`
+    : '';
+
+  const rules = `Your ONLY job is to detect information loss or factual error.
+
+Procedure:
+1. List the explicit requirements stated in the question.
+2. For each requirement, decide whether A satisfies it and whether B satisfies it.
+3. Decide using ONLY these criteria, in this order:
+   - Factual error: if one answer contains a clear factual or technical error that the other does not, that answer is worse.
+   - Requirement coverage: if a stated requirement is satisfied by only one answer, that answer is better.
+   - Otherwise the two are equivalent.
+4. These differences MUST be judged as equivalent, never as better or worse:
+   - length, level of detail, number of examples, or extra tips beyond the stated requirements
+   - wording, formatting, code style, ordering
+   - different but equally valid technical choices (a different library, API, or implementation approach that both satisfy the requirement)`;
+
+  // 不设"必须二选一"模式：强制二选一时模型会退回到按篇幅/详尽度挑一个，
+  // 且在 A 位固定放原始答案时会产生系统性偏向（详见 judgeSymmetric 的说明）。
+  const systemPrompt = `You are an impartial judge comparing two answers to the same question.\n\n${rules}\n\nWrite 2-3 sentences of reasoning, then end with a final line exactly in this form:\nVERDICT: A\n(or) VERDICT: B\n(or) VERDICT: tie`;
 
   const messages: Message[] = [
     { role: 'system', content: systemPrompt },
     {
       role: 'user',
-      content: `Question: ${question}\n\nAnswer A:\n${answerA}\n\nAnswer B:\n${answerB}\n\nWhich is better?`,
+      content: `Question: ${question}\n${reqBlock}\nAnswer A:\n${answerA}\n\nAnswer B:\n${answerB}\n\nWhich is better?`,
     },
   ];
 
   const resp = await callLLM(DEEPSEEK_BASE, DEEPSEEK_API_KEY, messages);
-  const trimmed = resp.content.trim().toLowerCase();
-  if (trimmed.startsWith('a')) return 'A';
-  if (trimmed.startsWith('b')) return 'B';
-  return 'tie';
+  // 先取 CoT 结尾的 VERDICT 行，解析失败再回退到整体首字符
+  const match = resp.content.match(/VERDICT:\s*(A|B|tie)\b/i);
+  const trimmed = (match?.[1] ?? resp.content.trim()).toLowerCase();
+  // 判定理由（CoT）保留进报告：定位 Judge 误判时靠的就是这些文字，不能只留结论
+  const reason = resp.content
+    .replace(/VERDICT:\s*(A|B|tie)\b.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 220);
+  const verdict: JudgeVerdict = trimmed.startsWith('a') ? 'A'
+    : trimmed.startsWith('b') ? 'B'
+      : 'tie';
+  return { verdict, reason };
 }
 
-// 交换位置跑两次 + 第三轮决胜
+// 交换位置跑两次；结论不一致即判持平（不做第三轮决胜）
 async function judgeSymmetric(
   question: string,
   answerRaw: string,
@@ -807,25 +863,25 @@ async function judgeSymmetric(
   let verdict: 'raw_better' | 'compressed_better' | 'tie';
   let detail: string;
 
-  if (v1 === 'A' && v2 === 'B') {
+  if (v1.verdict === 'A' && v2.verdict === 'B') {
     verdict = 'raw_better';
-    detail = `v1(raw=A)=A, v2(raw=B)=B`;
-  } else if (v1 === 'B' && v2 === 'A') {
+    detail = `v1(raw=A)=A — ${v1.reason} ／ v2(raw=B)=B — ${v2.reason}`;
+  } else if (v1.verdict === 'B' && v2.verdict === 'A') {
     verdict = 'compressed_better';
-    detail = `v1(raw=A)=B, v2(raw=B)=A`;
-  } else if (v1 === 'tie' && v2 === 'tie') {
+    detail = `v1(raw=A)=B — ${v1.reason} ／ v2(raw=B)=A — ${v2.reason}`;
+  } else if (v1.verdict === 'tie' && v2.verdict === 'tie') {
     verdict = 'tie';
-    detail = `v1=tie, v2=tie`;
+    detail = `v1=tie — ${v1.reason} ／ v2=tie — ${v2.reason}`;
   } else {
-    // 不一致，跑第三轮决胜
-    const v3 = await judgeCall(question, answerRaw, answerCompressed, true);
-    if (v3 === 'A') {
-      verdict = 'raw_better';
-      detail = `v1=${v1}, v2=${v2}, v3(决胜)=A`;
-    } else {
-      verdict = 'compressed_better';
-      detail = `v1=${v1}, v2=${v2}, v3(决胜)=B`;
-    }
+    // 两次位置交换结论不一致 → Judge 无法稳定区分，判持平。
+    //
+    // 旧实现在此跑第三轮决胜，存在系统性偏差：决胜轮的 A 位固定是原始答案，
+    // 且 prompt 兜底写着"仍相同则输出 A"，于是所有边缘样本都会被判成 raw_better。
+    // 实测反例：v1=tie、v2=A（该轮 A 位是压缩答案，即压缩更好），决胜仍判 raw_better。
+    // 位置交换的目的本就是检验判定稳定性；不稳定即说明差异小于 Judge 的分辨率，
+    // 判持平比强行决胜更诚实，也省掉一次 API 调用。
+    verdict = 'tie';
+    detail = `v1=${v1.verdict} — ${v1.reason} ／ v2=${v2.verdict} — ${v2.reason}（两次不一致 → 判持平）`;
   }
 
   return { verdict, detail };
@@ -841,9 +897,12 @@ function extractRequirements(question: string): string[] {
 interface QualityEval {
   similarity: number;
   similarityReason: string;
+  similarityValid: boolean;
   rawCoverage: number;
   proxyCoverage: number;
   coverageReason: string;
+  coverageValid: boolean;
+  qualityValid: boolean;
 }
 
 // 语义相似度：以原始回答为 reference，评估压缩后回答保留了多少关键信息。
@@ -852,7 +911,7 @@ async function judgeSimilarity(
   question: string,
   reference: string,
   candidate: string,
-): Promise<{ similarity: number; reason: string }> {
+): Promise<{ similarity: number; reason: string; valid: boolean }> {
   const messages: Message[] = [
     {
       role: 'system',
@@ -877,10 +936,14 @@ async function judgeSimilarity(
   const resp = await callLLM(DEEPSEEK_BASE, DEEPSEEK_API_KEY, messages);
   try {
     const jsonMatch = resp.content.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(jsonMatch![0]);
-    return { similarity: parsed.similarity ?? 0, reason: parsed.reason ?? '' };
+    if (!jsonMatch) throw new Error('未找到 JSON');
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (typeof parsed.similarity !== 'number' || !Number.isFinite(parsed.similarity)) {
+      throw new Error('similarity 不是有效数字');
+    }
+    return { similarity: parsed.similarity, reason: parsed.reason ?? '', valid: true };
   } catch {
-    return { similarity: 0, reason: 'JSON 解析失败' };
+    return { similarity: 0, reason: 'JSON 解析失败', valid: false };
   }
 }
 
@@ -890,7 +953,7 @@ async function judgeCoverage(
   answerA: string,
   answerB: string,
   requirements: string[],
-): Promise<{ rawCoverage: number; proxyCoverage: number; reason: string }> {
+): Promise<{ rawCoverage: number; proxyCoverage: number; reason: string; valid: boolean }> {
   const reqText = requirements.length > 0
     ? requirements.map((item, i) => `${i + 1}. ${item}`).join('\n')
     : '请从 Question 中提取核心需求';
@@ -913,14 +976,22 @@ async function judgeCoverage(
   const resp = await callLLM(DEEPSEEK_BASE, DEEPSEEK_API_KEY, messages);
   try {
     const jsonMatch = resp.content.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(jsonMatch![0]);
+    if (!jsonMatch) throw new Error('未找到 JSON');
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (typeof parsed.rawCoverage !== 'number'
+      || !Number.isFinite(parsed.rawCoverage)
+      || typeof parsed.proxyCoverage !== 'number'
+      || !Number.isFinite(parsed.proxyCoverage)) {
+      throw new Error('coverage 不是有效数字');
+    }
     return {
-      rawCoverage: parsed.rawCoverage ?? 0,
-      proxyCoverage: parsed.proxyCoverage ?? 0,
+      rawCoverage: parsed.rawCoverage,
+      proxyCoverage: parsed.proxyCoverage,
       reason: parsed.reason ?? '',
+      valid: true,
     };
   } catch {
-    return { rawCoverage: 0, proxyCoverage: 0, reason: 'JSON 解析失败' };
+    return { rawCoverage: 0, proxyCoverage: 0, reason: 'JSON 解析失败', valid: false };
   }
 }
 
@@ -934,9 +1005,12 @@ async function judgeQuality(question: string, answerA: string, answerB: string):
   return {
     similarity: sim.similarity,
     similarityReason: sim.reason,
+    similarityValid: sim.valid,
     rawCoverage: cov.rawCoverage,
     proxyCoverage: cov.proxyCoverage,
     coverageReason: cov.reason,
+    coverageValid: cov.valid,
+    qualityValid: sim.valid && cov.valid,
   };
 }
 
@@ -953,9 +1027,12 @@ interface TurnEval {
   judgeDetail: string;
   similarity: number;
   similarityReason: string;
+  similarityValid: boolean;
   rawCoverage: number;
   proxyCoverage: number;
   coverageReason: string;
+  coverageValid: boolean;
+  qualityValid: boolean;
   truncated: boolean;
   directCacheHit: number;
   proxyCacheHit: number;
@@ -989,9 +1066,12 @@ async function evalSingleTurn(
   let judgeDetail = '无压缩，跳过评测';
   let similarity = 100;
   let similarityReason = '无压缩，两者一致';
+  let similarityValid = true;
   let rawCoverage = 100;
   let proxyCoverage = 100;
   let coverageReason = '无压缩，两者一致';
+  let coverageValid = true;
+  let qualityValid = true;
 
   if (hasCompression && !truncated) {
     // 有压缩，做 LLM-as-judge 评测
@@ -1002,16 +1082,22 @@ async function evalSingleTurn(
     const quality = await judgeQuality(dd.user, dd.assistant, pd.assistant);
     similarity = quality.similarity;
     similarityReason = quality.similarityReason;
+    similarityValid = quality.similarityValid;
     rawCoverage = quality.rawCoverage;
     proxyCoverage = quality.proxyCoverage;
     coverageReason = quality.coverageReason;
+    coverageValid = quality.coverageValid;
+    qualityValid = quality.qualityValid;
   } else if (truncated) {
     judgeDetail = '输出截断，跳过质量评测';
     similarity = 0;
     similarityReason = `finish_reason: raw=${dd.finishReason}, proxy=${pd.finishReason}`;
+    similarityValid = false;
     rawCoverage = 0;
     proxyCoverage = 0;
     coverageReason = '输出被 max_tokens 截断';
+    coverageValid = false;
+    qualityValid = false;
   }
 
   return {
@@ -1020,9 +1106,12 @@ async function evalSingleTurn(
     judgeDetail,
     similarity,
     similarityReason,
+    similarityValid,
     rawCoverage,
     proxyCoverage,
     coverageReason,
+    coverageValid,
+    qualityValid,
     truncated,
     directCacheHit,
     proxyCacheHit,
@@ -1091,9 +1180,12 @@ class PipelinedEvaluator {
         judgeDetail: `Judge 失败: ${(err as Error).message}`,
         similarity: 0,
         similarityReason: 'Judge 异常',
+        similarityValid: false,
         rawCoverage: 0,
         proxyCoverage: 0,
         coverageReason: 'Judge 异常',
+        coverageValid: false,
+        qualityValid: false,
         truncated: false,
         directCacheHit: 0,
         proxyCacheHit: 0,
@@ -1151,7 +1243,12 @@ function printResult(result: RunResult): void {
   for (const t of result.perTurn) {
     const bar = '▎'.repeat(Math.min(Math.floor(t.inputTokens / 200), 30));
     const finish = t.finishReason === 'length' ? ` ${C.red}[truncated]${C.reset}` : '';
-    console.log(`    轮 ${String(t.turn).padStart(2)}: ${String(t.inputTokens).padStart(5)} ${C.gray}${bar}${C.reset}${finish}`);
+    // 逐轮 Provider 缓存：用于诊断 rotation/评测流水线对前缀缓存的影响
+    const cacheTotal = t.providerCacheHitTokens + t.providerCacheMissTokens;
+    const cache = cacheTotal > 0
+      ? `cache ${t.providerCacheHitTokens}/${cacheTotal}`
+      : 'cache -';
+    console.log(`    轮 ${String(t.turn).padStart(2)}: ${String(t.inputTokens).padStart(5)} ${C.gray}${bar}${C.reset} ${C.dim}${cache}${C.reset}${finish}`);
   }
 }
 
@@ -1234,6 +1331,7 @@ function saveToFile(
   direct: RunResult,
   proxy: RunResult,
   turnEvals: TurnEval[],
+  pipelineJudge: boolean = false,
 ): string {
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const filename = `demo-eval-${ts}.md`;
@@ -1259,17 +1357,19 @@ function saveToFile(
   const pairwiseWins = compressedTurns.filter(e => e.judgeVerdict === 'compressed_better').length;
   const pairwiseTies = compressedTurns.filter(e => e.judgeVerdict === 'tie').length;
   const pairwiseLosses = compressedTurns.filter(e => e.judgeVerdict === 'raw_better').length;
-  const severeRegressions = compressedTurns.filter(e => e.similarity < 70).length;
+  const similarityTurns = compressedTurns.filter(e => e.similarityValid);
+  const coverageTurns = compressedTurns.filter(e => e.coverageValid);
+  const severeRegressions = similarityTurns.filter(e => e.similarity < 70).length;
 
   // 平均语义相似度（只算有压缩的轮次）
-  const avgSimilarity = compressedTurns.length > 0
-    ? (compressedTurns.reduce((s, e) => s + e.similarity, 0) / compressedTurns.length).toFixed(1)
+  const avgSimilarity = similarityTurns.length > 0
+    ? (similarityTurns.reduce((s, e) => s + e.similarity, 0) / similarityTurns.length).toFixed(1)
     : '100.0';
-  const avgRawCoverage = compressedTurns.length > 0
-    ? (compressedTurns.reduce((s, e) => s + e.rawCoverage, 0) / compressedTurns.length).toFixed(1)
+  const avgRawCoverage = coverageTurns.length > 0
+    ? (coverageTurns.reduce((s, e) => s + e.rawCoverage, 0) / coverageTurns.length).toFixed(1)
     : '100.0';
-  const avgProxyCoverage = compressedTurns.length > 0
-    ? (compressedTurns.reduce((s, e) => s + e.proxyCoverage, 0) / compressedTurns.length).toFixed(1)
+  const avgProxyCoverage = coverageTurns.length > 0
+    ? (coverageTurns.reduce((s, e) => s + e.proxyCoverage, 0) / coverageTurns.length).toFixed(1)
     : '100.0';
 
   // 平均缓存命中率（从第 2 轮开始算）
@@ -1286,7 +1386,12 @@ function saveToFile(
   lines.push(`- 时间: ${new Date().toISOString()}`);
   lines.push(`- 模型: ${MODEL}`);
   lines.push(`- 总轮次: ${turnEvals.length}`);
-  lines.push(`- 评测方法: Pairwise + 位置交换 + 第三轮决胜 + LLM 语义相似度`);
+  lines.push(`- 评测方法: Pairwise（需求逐条核对 + 位置交换，两次不一致判持平）+ LLM 语义相似度`);
+  lines.push(`- Judge 调度: ${pipelineJudge ? '流水线并行（Judge 与下一轮对话并发）' : '串行（对话全部结束后统一评测）'}`);
+  if (pipelineJudge) {
+    lines.push(`  - ⚠️ 流水线并行下 Judge 并发请求会挤占 DeepSeek 补全缓存写入，`);
+    lines.push(`    代理的 Provider 缓存/费用列被系统性低估，不可用于缓存经济性结论。`);
+  }
   lines.push(``);
   lines.push(`## 汇总`);
   lines.push(``);
@@ -1296,9 +1401,9 @@ function saveToFile(
   lines.push(`| 最后一轮输入 | ${direct.finalInputTokens} | ${proxy.finalInputTokens} | ${finalSaved} (${finalSavedPct}%) |`);
   lines.push(`| Pairwise 非劣率 | - | - | ${accuracyRetention}% |`);
   lines.push(`| Pairwise 胜/平/负 | - | - | ${pairwiseWins}/${pairwiseTies}/${pairwiseLosses} |`);
-  lines.push(`| 严重退化轮次（相似度<70） | - | - | ${severeRegressions}/${compressedTurns.length} |`);
-  lines.push(`| 平均语义相似度 | - | - | ${avgSimilarity}% |`);
-  lines.push(`| 平均需求覆盖率 | ${avgRawCoverage}% | ${avgProxyCoverage}% | ${(Number(avgProxyCoverage) - Number(avgRawCoverage)).toFixed(1)}pp |`);
+  lines.push(`| 严重退化轮次（相似度<70） | - | - | ${severeRegressions}/${similarityTurns.length} 有效 / ${compressedTurns.length} 压缩 |`);
+  lines.push(`| 平均语义相似度 | - | - | ${avgSimilarity}%（${similarityTurns.length}/${compressedTurns.length} 有效） |`);
+  lines.push(`| 平均需求覆盖率 | ${avgRawCoverage}% | ${avgProxyCoverage}% | ${(Number(avgProxyCoverage) - Number(avgRawCoverage)).toFixed(1)}pp（${coverageTurns.length}/${compressedTurns.length} 有效） |`);
   lines.push(`| 输出截断轮次 | - | - | ${truncatedTurns}/${turnEvals.length} |`);
   lines.push(`| 平均缓存命中率 | ${avgDirectCache}% | ${avgProxyCache}% | - |`);
   const directProviderTotal = direct.totalProviderCacheHitTokens + direct.totalProviderCacheMissTokens;
@@ -1425,8 +1530,12 @@ function saveToFile(
       if (ev.truncated) {
         lines.push(`- **输出截断:** 是 — ${ev.similarityReason}`);
       } else {
-        lines.push(`- **语义相似度:** ${ev.similarity.toFixed(1)}% — ${ev.similarityReason}`);
-        lines.push(`- **需求覆盖率:** 直连 ${ev.rawCoverage.toFixed(1)}% / 代理 ${ev.proxyCoverage.toFixed(1)}% — ${ev.coverageReason}`);
+        lines.push(ev.similarityValid
+          ? `- **语义相似度:** ${ev.similarity.toFixed(1)}% — ${ev.similarityReason}`
+          : `- **语义相似度:** 无效 — ${ev.similarityReason}`);
+        lines.push(ev.coverageValid
+          ? `- **需求覆盖率:** 直连 ${ev.rawCoverage.toFixed(1)}% / 代理 ${ev.proxyCoverage.toFixed(1)}% — ${ev.coverageReason}`
+          : `- **需求覆盖率:** 无效 — ${ev.coverageReason}`);
       }
     }
     lines.push(``);
@@ -1458,6 +1567,18 @@ function parseArgs(argv: string[]): {
   ablation: boolean;
   demo: boolean;
   fullContent: boolean;
+  // 流水线并行评测（Judge 与下一轮对话并发）。
+  // 默认 false：Judge 并发请求会挤占 DeepSeek 的补全缓存写入，使代理的 Provider cache 被系统性低估。
+  // 需要测速时用 --pipeline-judge 显式开启。
+  pipelineJudge: boolean;
+  // rotation 经济性门槛：要求"预计节省 Δ ≥ ratio × 一次性改写成本"才允许改写缓存前缀。
+  // 默认 0 = 关闭（既有行为）。设为 1.0 表示 Δ 至少要覆盖改写成本（回本 ≈ 10 轮）。
+  rotationMinSavingsRatio: number;
+  // 硬约束兜底：上下文 total 达到该 token 数时，忽略经济门槛与 rotationAfterRounds 强制 rotation。
+  // 默认 0 = 关闭。用于避免"只算经济账 → 永不压缩 → 上下文溢出"。
+  rotationForceTokens: number;
+  // 模型上下文窗口上限：提供后由 engine 自动推导硬约束阈值（显式 rotationForceTokens 优先）。
+  contextWindowTokens: number;
 } {
   const args = {
     mode: 'direct' as 'direct' | 'proxy' | 'compare',
@@ -1473,6 +1594,10 @@ function parseArgs(argv: string[]): {
     ablation: false,
     demo: false,
     fullContent: false,
+    pipelineJudge: false,
+    rotationMinSavingsRatio: 0,
+    rotationForceTokens: 0,
+    contextWindowTokens: 0,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -1488,6 +1613,19 @@ function parseArgs(argv: string[]): {
     else if (arg === '--ablation') args.ablation = true;
     else if (arg === '--demo') args.demo = true;
     else if (arg === '--full-content') args.fullContent = true;
+    else if (arg === '--pipeline-judge') args.pipelineJudge = true;
+    else if (arg === '--rotation-ratio') {
+      const next = argv[++i];
+      if (next) args.rotationMinSavingsRatio = parseFloat(next);
+    }
+    else if (arg === '--rotation-force-tokens') {
+      const next = argv[++i];
+      if (next) args.rotationForceTokens = parseInt(next, 10);
+    }
+    else if (arg === '--context-window') {
+      const next = argv[++i];
+      if (next) args.contextWindowTokens = parseInt(next, 10);
+    }
     else if (arg === '--turns' || arg === '-n') {
       const next = argv[i + 1];
       if (next) args.turns = parseInt(next, 10);
@@ -1629,19 +1767,21 @@ function computeGroupMetrics(result: RunResult, turnEvals: TurnEval[], baselineI
   const wins = compressedTurns.filter(e => e.judgeVerdict === 'compressed_better').length;
   const ties = compressedTurns.filter(e => e.judgeVerdict === 'tie').length;
   const losses = compressedTurns.filter(e => e.judgeVerdict === 'raw_better').length;
-  const severe = compressedTurns.filter(e => e.similarity < 70).length;
-  const avgSim = compressedTurns.length > 0
-    ? (compressedTurns.reduce((s, e) => s + e.similarity, 0) / compressedTurns.length).toFixed(1)
+  const similarityTurns = compressedTurns.filter(e => e.similarityValid);
+  const coverageTurns = compressedTurns.filter(e => e.coverageValid);
+  const severe = similarityTurns.filter(e => e.similarity < 70).length;
+  const avgSim = similarityTurns.length > 0
+    ? (similarityTurns.reduce((s, e) => s + e.similarity, 0) / similarityTurns.length).toFixed(1)
     : '100.0';
-  const avgProxyCov = compressedTurns.length > 0
-    ? (compressedTurns.reduce((s, e) => s + e.proxyCoverage, 0) / compressedTurns.length).toFixed(1)
+  const avgProxyCov = coverageTurns.length > 0
+    ? (coverageTurns.reduce((s, e) => s + e.proxyCoverage, 0) / coverageTurns.length).toFixed(1)
     : '100.0';
   const truncatedTurns = turnEvals.filter(e => e.truncated).length;
 
   return {
     inputSaved, inputSavedPct, providerCacheRate, cost,
     accuracyRetention, wins, ties, losses, severe, avgSim, avgProxyCov,
-    compressedCount: compressedTurns.length, truncatedTurns,
+    compressedCount: compressedTurns.length, qualityCount: similarityTurns.length, truncatedTurns,
     totalInput: result.totalInputTokens,
     finalInput: result.finalInputTokens,
     cacheHit: result.totalProviderCacheHitTokens,
@@ -1669,7 +1809,7 @@ function saveAblationReport(
   lines.push(`- 模型: ${MODEL}`);
   lines.push(`- 总轮次: ${turns}`);
   lines.push(`- 预算 budget: ${budget}`);
-  lines.push(`- 评测方法: Pairwise (位置交换 + 第三轮决胜) + LLM 语义相似度 + 需求覆盖率`);
+  lines.push(`- 评测方法: Pairwise（需求逐条核对 + 位置交换，两次不一致判持平）+ LLM 语义相似度 + 需求覆盖率`);
   lines.push(`- 费用模型: DeepSeek 缓存折扣 (cache hit 1折 / miss 原价 / output $0.28/1M)`);
   lines.push(``);
 
@@ -1687,8 +1827,8 @@ function saveAblationReport(
   lines.push(`| 费用 USD (缓存折扣) | ${allGroups.map(g => '$' + computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens).cost.toFixed(4)).join(' | ')} |`);
   lines.push(`| Pairwise 非劣率 | - | ${groups.map(g => computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens).accuracyRetention + '%').join(' | ')} |`);
   lines.push(`| 胜/平/负 | - | ${groups.map(g => { const m = computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens); return `${m.wins}/${m.ties}/${m.losses}`; }).join(' | ')} |`);
-  lines.push(`| 严重退化 (相似度<70) | - | ${groups.map(g => { const m = computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens); return `${m.severe}/${m.compressedCount}`; }).join(' | ')} |`);
-  lines.push(`| 平均语义相似度 | - | ${groups.map(g => computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens).avgSim + '%').join(' | ')} |`);
+  lines.push(`| 严重退化 (相似度<70) | - | ${groups.map(g => { const m = computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens); return `${m.severe}/${m.qualityCount} 有效 / ${m.compressedCount} 压缩`; }).join(' | ')} |`);
+  lines.push(`| 平均语义相似度 | - | ${groups.map(g => { const m = computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens); return `${m.avgSim}% (${m.qualityCount}/${m.compressedCount} 有效)`; }).join(' | ')} |`);
   lines.push(`| 平均需求覆盖率 | - | ${groups.map(g => computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens).avgProxyCov + '%').join(' | ')} |`);
   lines.push(`| 输出截断轮次 | ${allGroups.map(g => computeGroupMetrics(g.result, g.turnEvals, baseline.result.totalInputTokens).truncatedTurns).join(' | ')} |`);
   lines.push(``);
@@ -2376,9 +2516,15 @@ async function saveDetailedDemoReport(params: {
       if (rawDlg) {
         try {
           const quality = await judgeQuality(d.user, rawDlg.assistant, d.assistant);
-          lines.push(`- 语义相似度: **${quality.similarity.toFixed(1)}%** — ${quality.similarityReason}`);
-          lines.push(`- 需求覆盖率: 直连 ${quality.rawCoverage.toFixed(1)}% / 代理 ${quality.proxyCoverage.toFixed(1)}% — ${quality.coverageReason}`);
-          if (quality.similarity < 70) lines.push(`- ⚠️ **严重退化（相似度 < 70）**`);
+          lines.push(quality.similarityValid
+            ? `- 语义相似度: **${quality.similarity.toFixed(1)}%** — ${quality.similarityReason}`
+            : `- 语义相似度: **无效** — ${quality.similarityReason}`);
+          lines.push(quality.coverageValid
+            ? `- 需求覆盖率: 直连 ${quality.rawCoverage.toFixed(1)}% / 代理 ${quality.proxyCoverage.toFixed(1)}% — ${quality.coverageReason}`
+            : `- 需求覆盖率: **无效** — ${quality.coverageReason}`);
+          if (quality.similarityValid && quality.similarity < 70) {
+            lines.push(`- ⚠️ **严重退化（相似度 < 70）**`);
+          }
         } catch (e) {
           lines.push(`- 评测失败: ${(e as Error).message}`);
         }
@@ -2434,6 +2580,10 @@ async function main(): Promise<void> {
   }
 
   const turns = buildDemoTurns().slice(0, args.turns);
+  ROTATION_MIN_SAVINGS_RATIO = args.rotationMinSavingsRatio;
+  ROTATION_FORCE_TOKENS = args.rotationForceTokens;
+  CONTEXT_WINDOW_TOKENS = args.contextWindowTokens;
+  RESERVE_OUTPUT_TOKENS = args.maxOutput;
 
   printHeader(`Demo Client - ${args.mode} 模式 (${turns.length} 轮真实对话)${args.verbose ? ' [verbose]' : ''}`);
   console.log(`  ${C.gray}模型: ${MODEL}${C.reset}`);
@@ -2444,8 +2594,21 @@ async function main(): Promise<void> {
     console.log(`  ${C.gray}代理模式: 本地 engine 处理 (budget=${args.budget})${C.reset}`);
     console.log(`  ${C.gray}评测轨迹: ${args.rollout ? 'end-to-end rollout' : 'controlled replay（固定直连历史）'}${C.reset}`);
     console.log(`  ${C.gray}结构化摘要: ${args.summarize ? 'on' : 'off'}${C.reset}`);
+    console.log(`  ${C.gray}Judge 调度: ${args.pipelineJudge ? '流水线并行（会扰动 Provider 缓存测量，仅用于提速）' : '串行（默认，缓存/费用测量准确）'}${C.reset}`);
+    console.log(`  ${C.gray}rotation 经济性门槛: ${args.rotationMinSavingsRatio > 0 ? `Δ ≥ ${args.rotationMinSavingsRatio} × 改写成本` : '关闭（既有行为）'}${C.reset}`);
+    console.log(`  ${C.gray}硬约束兜底: ${args.rotationForceTokens > 0
+      ? `total ≥ ${args.rotationForceTokens} tok 时强制 rotation（显式）`
+      : (args.contextWindowTokens > 0
+        ? `自动推导（窗口 ${args.contextWindowTokens} − 输出预留 ${args.maxOutput}，×0.6）`
+        : '关闭')}${C.reset}`);
   } else if (args.mode === 'proxy') {
     console.log(`  ${C.gray}代理模式: 本地 engine 处理 (budget=${args.budget})${C.reset}`);
+    console.log(`  ${C.gray}rotation 经济性门槛: ${args.rotationMinSavingsRatio > 0 ? `Δ ≥ ${args.rotationMinSavingsRatio} × 改写成本` : '关闭（既有行为）'}${C.reset}`);
+    console.log(`  ${C.gray}硬约束兜底: ${args.rotationForceTokens > 0
+      ? `total ≥ ${args.rotationForceTokens} tok 时强制 rotation（显式）`
+      : (args.contextWindowTokens > 0
+        ? `自动推导（窗口 ${args.contextWindowTokens} − 输出预留 ${args.maxOutput}，×0.6）`
+        : '关闭')}${C.reset}`);
   }
   if (args.verbose) {
     console.log(`  ${C.gray}verbose 模式: 每轮对话详情将实时输出${C.reset}`);
@@ -2502,13 +2665,14 @@ async function main(): Promise<void> {
     );
     console.log('');
     const valid = calibrationEvals.filter((item) => !item.truncated);
+    const similarityValid = valid.filter((item) => item.similarityValid);
     const rawPreferred = valid.filter((item) => item.judgeVerdict === 'raw_better').length;
     const secondPreferred = valid.filter((item) => item.judgeVerdict === 'compressed_better').length;
     const ties = valid.filter((item) => item.judgeVerdict === 'tie').length;
-    const avgSimilarity = valid.length > 0
-      ? valid.reduce((sum, item) => sum + item.similarity, 0) / valid.length
+    const avgSimilarity = similarityValid.length > 0
+      ? similarityValid.reduce((sum, item) => sum + item.similarity, 0) / similarityValid.length
       : 0;
-    console.log(`  ${C.bold}No-op 校准:${C.reset} first/second/tie = ${rawPreferred}/${secondPreferred}/${ties}, 平均相似度 ${avgSimilarity.toFixed(1)}%`);
+    console.log(`  ${C.bold}No-op 校准:${C.reset} first/second/tie = ${rawPreferred}/${secondPreferred}/${ties}, 平均相似度 ${avgSimilarity.toFixed(1)}%（${similarityValid.length}/${valid.length} 有效）`);
     console.log(`  ${C.gray}该结果是 Pairwise 与生成噪声的下限，不应归因于压缩。${C.reset}\n`);
   }
 
@@ -2517,8 +2681,9 @@ async function main(): Promise<void> {
     console.log(`  ${C.gray}（budget=${args.budget}，启用压缩 + 预算管理）${C.reset}\n`);
 
     // 流水线并行评测器：第 i 轮 Judge 与第 i+1 轮对话并行
-    // 仅 compare 模式下且 directResult 已就绪时启用
-    if (args.mode === 'compare' && directResult) {
+    // 仅 compare 模式下、directResult 已就绪、且显式 --pipeline-judge 时启用。
+    // 默认串行：Judge 并发会挤占 DeepSeek 补全缓存写入，导致代理的 cache/费用被低估。
+    if (args.mode === 'compare' && directResult && args.pipelineJudge) {
       pipelinedEvaluator = new PipelinedEvaluator(
         directResult.dialogues,
         [],  // proxy dialogues 会在每轮 onTurnComplete 中追加
@@ -2582,32 +2747,34 @@ async function main(): Promise<void> {
     const accuracyRetention = compressedTurns.length > 0
       ? ((tieOrBetter / compressedTurns.length) * 100).toFixed(1)
       : '100.0';
-    const avgSim = compressedTurns.length > 0
-      ? (compressedTurns.reduce((s, e) => s + e.similarity, 0) / compressedTurns.length).toFixed(1)
+    const similarityTurns = compressedTurns.filter(e => e.similarityValid);
+    const coverageTurns = compressedTurns.filter(e => e.coverageValid);
+    const avgSim = similarityTurns.length > 0
+      ? (similarityTurns.reduce((s, e) => s + e.similarity, 0) / similarityTurns.length).toFixed(1)
       : '100.0';
     const wins = compressedTurns.filter(e => e.judgeVerdict === 'compressed_better').length;
     const ties = compressedTurns.filter(e => e.judgeVerdict === 'tie').length;
     const losses = compressedTurns.filter(e => e.judgeVerdict === 'raw_better').length;
-    const severe = compressedTurns.filter(e => e.similarity < 70).length;
-    const rawCoverage = compressedTurns.length > 0
-      ? compressedTurns.reduce((s, e) => s + e.rawCoverage, 0) / compressedTurns.length
+    const severe = similarityTurns.filter(e => e.similarity < 70).length;
+    const rawCoverage = coverageTurns.length > 0
+      ? coverageTurns.reduce((s, e) => s + e.rawCoverage, 0) / coverageTurns.length
       : 100;
-    const proxyCoverage = compressedTurns.length > 0
-      ? compressedTurns.reduce((s, e) => s + e.proxyCoverage, 0) / compressedTurns.length
+    const proxyCoverage = coverageTurns.length > 0
+      ? coverageTurns.reduce((s, e) => s + e.proxyCoverage, 0) / coverageTurns.length
       : 100;
 
     console.log(`  ${C.bold}评测结果:${C.reset}`);
     console.log(`    有压缩的轮次: ${compressedTurns.length}/${turnEvals.length}`);
     console.log(`    Pairwise 非劣率: ${C.green}${accuracyRetention}%${C.reset} (${tieOrBetter}/${compressedTurns.length})`);
     console.log(`    Pairwise 胜/平/负: ${wins}/${ties}/${losses}`);
-    console.log(`    严重退化轮次（相似度<70）: ${severe}/${compressedTurns.length}`);
-    console.log(`    平均语义相似度: ${C.green}${avgSim}%${C.reset}`);
-    console.log(`    平均需求覆盖率: 直连 ${rawCoverage.toFixed(1)}% / 代理 ${proxyCoverage.toFixed(1)}% (${(proxyCoverage - rawCoverage).toFixed(1)}pp)`);
+    console.log(`    严重退化轮次（相似度<70）: ${severe}/${similarityTurns.length} 有效 / ${compressedTurns.length} 压缩`);
+    console.log(`    平均语义相似度: ${C.green}${avgSim}%${C.reset}（${similarityTurns.length}/${compressedTurns.length} 有效）`);
+    console.log(`    平均需求覆盖率: 直连 ${rawCoverage.toFixed(1)}% / 代理 ${proxyCoverage.toFixed(1)}% (${(proxyCoverage - rawCoverage).toFixed(1)}pp，${coverageTurns.length}/${compressedTurns.length} 有效)`);
     console.log(`    输出截断轮次: ${truncatedTurns}/${turnEvals.length}`);
     console.log('');
 
     // 保存报告
-    const filename = saveToFile(directResult, proxyResult, turnEvals);
+    const filename = saveToFile(directResult, proxyResult, turnEvals, args.pipelineJudge);
     console.log(`  ${C.magenta}评测报告已保存到: ${filename}${C.reset}`);
     console.log(`  ${C.gray}用编辑器打开查看每轮的问题、输入 token、缓存命中率、回答对比、评测分析${C.reset}`);
   } else if (directResult || proxyResult) {

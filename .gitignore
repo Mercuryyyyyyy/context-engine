@@ -13,6 +13,15 @@ coverage/
 .pnpm-store/
 .agents/
 
+# backups & temp dirs (never commit)
+*.bak
+*.bak-*
+.tmp-*/
+.tmp-*/
+
+# baseline backups (local-only experiment data)
+reports/_baseline-backup/
+
 # internal docs (kept local, not for public repo)
 *.docx
 RESUME_INTERVIEW_PREP.md

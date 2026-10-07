@@ -63,8 +63,10 @@ export interface EngineInput {
   previousMessages?: Message[];
   // 稳定前缀长度：前 N 条消息是上一轮压缩后的稳定前缀，本轮不应再次压缩。
   // 由调用方（如 demo-client 的 controlled replay）传入，用于保护 Provider 前缀缓存。
-  // 当 total 超过硬上限（highWatermark * 1.5）时，忽略此值并全量重压缩。
+  // 即使 total 超过 rotation threshold，也要等稳定轮数达到门槛后再全量重压缩。
   stablePrefixLength?: number;
+  // 当前稳定 epoch 已持续的完整轮数，用于延迟破坏 Provider 前缀缓存的轮换。
+  stablePrefixTurns?: number;
   // 是否启用可逆压缩，默认 true
   // 兼容旧配置：现在仅执行真正无损的空白归一化。
   enableReversible?: boolean;
@@ -96,6 +98,26 @@ export interface CompactionOptions {
   highWatermark?: number;
   // 低水位：摘要后的目标，默认 = budget * 0.7
   lowWatermark?: number;
+  // 稳定 epoch 至少保持的轮数，达到后才允许 rotation；默认 6。
+  rotationAfterRounds?: number;
+  // rotation 经济性门槛（默认 0 = 关闭，保持既有行为）。
+  // 改写稳定前缀会让"首个被改写点之后的所有内容"从 cache hit 降级为 cache miss（一次性全价），
+  // 收益是此后每轮前缀缩小 Δ（可持续，但只按 hit 价计）。
+  // DeepSeek 定价下 miss 是 hit 的 10 倍，故回本轮次 ≈ 10 × (改写成本 / Δ)。
+  // 设为 1.0 表示要求"预计节省 Δ ≥ 一次性改写成本"才允许 rotation。
+  rotationMinSavingsRatio?: number;
+  // 经济门槛的硬约束兜底（默认 0 = 关闭，保持既有行为）。
+  // rotationMinSavingsRatio 只算经济账，不达标时不压缩 → 上下文会持续膨胀。
+  // 当 total >= rotationForceTokens 时，说明上下文已逼近模型窗口上限，
+  // 此时"溢出风险"优先级高于"缓存经济性"：解除经济门槛与保护阈值，
+  // 强制允许 rotation 改写稳定前缀，并打 rotation-forced-limit 标记。
+  // 显式配置时优先使用；未提供则按 contextWindowTokens 自动推导。
+  rotationForceTokens?: number;
+  // 模型上下文窗口上限（token）。提供后自动推导 rotationForceTokens，
+  // 避免手工配置阈值时把滞回空间配得过小（见 rotationForceTokens 说明）。
+  contextWindowTokens?: number;
+  // 为模型输出预留的 token（从可用输入空间中扣除），默认 0。
+  reserveOutputTokens?: number;
 }
 
 export interface ArchiveOptions {

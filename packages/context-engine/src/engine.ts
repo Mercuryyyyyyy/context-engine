@@ -59,6 +59,14 @@ function relevanceToQuery(message: Message, query: string): number {
 
 // 从被清空的消息中提取少量关键词作为「语义脚手架」，
 // 让模型在 token 预算不变的情况下仍能感知被裁剪消息的主题（借鉴 Lost-in-the-Middle 与去噪压缩思路）。
+// 硬约束（rotationForceTokens）的紧急放大系数：
+// total ≥ rotationForceTokens × 该系数时，忽略 epoch 年龄立即强制 rotation。
+const ROTATION_EMERGENCY_FACTOR = 1.5;
+// 由 contextWindowTokens 自动推导 rotationForceTokens 时占用的可用输入空间比例。
+// 取 0.6 是为了保证滞回：紧急线 = 0.6 × 1.5 = 0.9，仍留出 10% 空间，
+// 使"突破阈值后等待 epoch 年龄"期间的增长不至于溢出。
+const ROTATION_FORCE_RATIO = 0.6;
+
 const HINT_STOPWORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'but', 'if', 'then', 'else', 'is', 'are', 'was',
   'were', 'be', 'been', 'for', 'of', 'to', 'in', 'on', 'with', 'this', 'that',
@@ -204,13 +212,23 @@ async function processArchive(
     return { messages, archivedModules: 0, archivedMessages: 0 };
   }
 
-  // 处理每个待归档模块
+  // 处理每个待归档模块。
+  // 已发送过的稳定前缀不能被删除或替换，否则下一轮 Provider 缓存会从该位置失效。
+  // 跨越稳定前缀的模块也暂缓归档，避免只归档模块的一部分导致状态与 ArchiveStore 不一致。
+  const archivableModules = stablePrefixLen > 0
+    ? observeResult.modulesToArchive.filter((module) =>
+      module.messageIndices.every((idx) => idx >= stablePrefixLen))
+    : observeResult.modulesToArchive;
+  if (archivableModules.length === 0) {
+    return { messages, archivedModules: 0, archivedMessages: 0 };
+  }
+
   let archivedModules = 0;
   let archivedMessages = 0;
   const messagesToReplace = new Set<number>();
   const archiveInsertions: Array<{ insertAt: number; msg: Message }> = [];
 
-  for (const module of observeResult.modulesToArchive) {
+  for (const module of archivableModules) {
     // 提取该模块的消息
     const moduleMessageIndices: number[] = [];
     for (const idx of module.messageIndices) {
@@ -326,19 +344,90 @@ export async function runEngine(input: EngineInput): Promise<EngineOutput> {
   const target = (): number | undefined => lowWatermark ?? highWatermark;
 
   // Compaction Epoch：稳定前缀保护。
-  // 当 stablePrefixLength > 0（调用方传入上一轮压缩后的稳定前缀长度）且未超硬上限时，
-  // 跳过稳定前缀部分，只允许压缩新增消息。这样前缀保持逐字一致，Provider 缓存可命中。
-  // 只有超过硬上限（highWatermark * 1.5）时才全量重压缩，生成新的稳定前缀。
-  // 已有 context-archive 消息时，将保护阈值提高到 hardLimit * 2，
-  // 让首次归档后的稳定前缀能持续命中缓存（clear-middle 只处理新增消息）。
+  // 正常水位内跳过稳定前缀，只允许压缩新增消息。
+  // 即使超过 rotation threshold，也要等稳定 epoch 持续足够轮数后才允许全量重压缩。
   const stablePrefixLength = input.stablePrefixLength ?? 0;
+  const stablePrefixTurns = input.stablePrefixTurns ?? 0;
+  const rotationAfterRounds = Math.max(0, input.compaction?.rotationAfterRounds ?? 6);
   const hardLimit = highWatermark ? Math.floor(highWatermark * 1.5) : undefined;
-  const hasExistingArchiveInWorking = workingMessages.some((m) => m.name === 'context-archive');
-  const protectionThreshold = hasExistingArchiveInWorking && hardLimit
+  const hasExistingCompaction = workingMessages.some((m) =>
+    m.name === 'context-summary' || m.name === 'context-archive');
+  const protectionThreshold = hasExistingCompaction && hardLimit
     ? hardLimit * 2
     : hardLimit;
+  // 硬约束兜底：上下文逼近模型窗口上限时，溢出风险优先于缓存经济性。
+  // 此时解除"经济性门槛"与"保护阈值"两道锁，允许 rotation 改写稳定前缀。
+  // 典型取值：模型上下文上限减去预留输出与安全余量。
+  //
+  // 注意：硬约束【不】解除 rotationAfterRounds（epoch 年龄）约束。
+  // 实测反例：若同时绕过轮数，压缩后的 total 仍贴近阈值时，下一轮会立刻再次触发强制，
+  // 导致"每轮都 rotation"——缓存持续断裂（12 轮实测 cache 34.3%，远差于不压缩）。
+  // 保留轮数约束可保证强制 rotation 是稀疏的（至多每 rotationAfterRounds 轮一次），
+  // 给新 epoch 留出重建缓存的时间；刚 rotation 过的前缀本来也不会立刻溢出。
+  // 硬约束阈值：显式 rotationForceTokens 优先；否则由模型窗口自动推导。
+  // 自动推导 = (窗口 − 预留输出) × ROTATION_FORCE_RATIO，
+  // 目的是避免手工配置把阈值贴到"压缩能力下限"上（滞回不足会频繁触发紧急通道）。
+  const explicitForceTokens = Math.max(0, input.compaction?.rotationForceTokens ?? 0);
+  const contextWindowTokens = Math.max(0, input.compaction?.contextWindowTokens ?? 0);
+  const reserveOutputTokens = Math.max(0, input.compaction?.reserveOutputTokens ?? 0);
+  const rotationForceTokens = explicitForceTokens > 0
+    ? explicitForceTokens
+    : (contextWindowTokens > 0
+      ? Math.max(0,
+        Math.floor((contextWindowTokens - reserveOutputTokens) * ROTATION_FORCE_RATIO))
+      : 0);
+  const rotationForced = rotationForceTokens > 0 && total >= rotationForceTokens;
+  // 紧急通道：稀疏化让"阈值刚被突破"时最多等待 rotationAfterRounds 轮，
+  // 期间上下文仍在增长；若已超过硬约束的 1.5 倍，说明逼近真实溢出，
+  // 不再等待 epoch 年龄，立即强制 rotation（缓存让位于可用性）。
+  const rotationEmergency = rotationForceTokens > 0
+    && total >= rotationForceTokens * ROTATION_EMERGENCY_FACTOR;
+  const rotationEligible = stablePrefixLength === 0
+    || rotationEmergency
+    || stablePrefixTurns >= rotationAfterRounds;
+
+  // Rotation 经济性门槛（rotationMinSavingsRatio > 0 时启用）：
+  // 改写稳定前缀会把"首个被改写点之后的所有内容"从 cache hit 降级为 cache miss（一次性全价），
+  // 收益只是此后每轮前缀缩小 Δ（按 hit 价计）。miss 单价是 hit 的 10 倍，
+  // 故回本轮次 ≈ 10 × (改写成本 / Δ)。不达标时把本轮 rotation 降级为"保护模式"，
+  // 让旧前缀继续吃缓存（同时避免 losslessNormalize 改写前缀内容破坏 block hash）。
+  const rotationMinSavingsRatio = input.compaction?.rotationMinSavingsRatio ?? 0;
+  const rotationEconomyOk = ((): boolean => {
+    if (stablePrefixLength === 0 || rotationMinSavingsRatio <= 0) return true;
+    if (rotationForced) return true;
+    // 候选：与 clear-middle 相同的选段逻辑（假设无保护时会被清空的中间消息）
+    const protectHead = 2;
+    const tailCount = Math.max(2, recentKeep);
+    const candidates = annotated
+      .map((item, idx) => ({ item, idx }))
+      .filter(({ item }) => item.tier === 'history' && !item.dropped
+        && item.msg.name !== 'context-summary'
+        && item.msg.name !== 'context-archive')
+      .slice(protectHead, Math.max(protectHead, annotated.length - tailCount));
+    if (candidates.length === 0) return true;
+    const estimateSaving = (item: (typeof annotated)[number]): number => {
+      const content = messageContentToString(item.msg.content);
+      const oldTokens = item.tokens;
+      const hint = extractHint(content);
+      const placeholder = hint
+        ? `[cleared: was ${oldTokens} tok | hint: ${hint}]`
+        : `[cleared: was ${oldTokens} tok]`;
+      return Math.max(0, oldTokens - countMessageTokens({ ...item.msg, content: placeholder }));
+    };
+    const estSavings = candidates.reduce((sum, c) => sum + estimateSaving(c.item), 0);
+    // 改写成本：首个被改写点之后仍在消息流中的内容，全部会从 hit 变 miss
+    const rewriteCost = annotated.slice(candidates[0]!.idx).reduce(
+      (sum, it) => sum + (it.dropped ? 0 : it.tokens), 0);
+    return rewriteCost > 0 && estSavings >= rotationMinSavingsRatio * rewriteCost;
+  })();
+
+  // rotationForceTokens 可能低于 protectionThreshold（highWatermark 的 1.5~3 倍），
+  // 此时 "total > protectionThreshold" 不成立会让硬约束失效，故强制时视为已超阈值。
+  const overProtectionThreshold = protectionThreshold === undefined
+    || rotationForced
+    || total > protectionThreshold;
   const protectStablePrefix = stablePrefixLength > 0
-    && (protectionThreshold === undefined || total <= protectionThreshold);
+    && (!rotationEligible || !rotationEconomyOk || !overProtectionThreshold);
 
   // 只有超过高水位时才启动有损策略，避免每轮重写稳定前缀。
   // losslessNormalize 也移到此处：虽然归一化本身无损，但改变消息字符内容会改变
@@ -448,6 +537,13 @@ export async function runEngine(input: EngineInput): Promise<EngineOutput> {
       (relevanceToQuery(a.item.msg, currentQuery) - relevanceToQuery(b.item.msg, currentQuery))
       || (a.item.originalIndex - b.item.originalIndex)
     );
+    // 经济性门槛未达标：本轮 rotation 已降级为保护模式（前缀不改写），仅打标记便于诊断。
+    // 硬约束触发时忽略门槛强制 rotation（缓存会断裂，但避免上下文溢出）。
+    // rotationEmergency 蕴含 rotationForced 与 rotationEligible，故优先打紧急标记
+    if (rotationEmergency) strategies.push('rotation-emergency');
+    else if (rotationForced && rotationEligible) strategies.push('rotation-forced-limit');
+    else if (!rotationEconomyOk) strategies.push('rotation-deferred-economy');
+
     let clearedMiddle = false;
     for (const { item } of middle) {
       if (total <= (target() ?? 0)) break;

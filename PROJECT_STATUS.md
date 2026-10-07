@@ -31,7 +31,7 @@
 - **Compaction Epoch 稳定前缀保护**：`stablePrefixLength` 保护上一轮压缩后的前缀不被再次压缩；归档/检索阈值提高到 `hardLimit * 2`，提供 5-7 轮稳定缓存窗口
 - **分层压缩阈值**：`highWatermark(budget)` → `hardLimit(1.5x)` → `rearchiveThreshold(2x)`
 - **P0-1 修复**：真实 HTTP 代理 Anthropic `/v1/messages` 端点接入归档系统（[server.ts](packages/context-proxy/src/server.ts)），CLI 新增 `--archive` / `--archive-delay` / `--archive-topic-threshold` / `--embed-*` 参数
-- **20 轮回归**（`reports/demo-eval-2026-07-22T14-15-20.md`）：
+- **20 轮回归**（`reports/demo-eval-2026-07-22T14-15-20.md`，⚠️ 经 2026-10-07 查证该报告同样不存在，下列数字仅供历史参考）：
   - 累计输入 188,933 → 152,084（**-19.5%**），最后一轮 -22.0%
   - 输出截断 **0/20**，严重退化 **0/10**，平均语义相似度 **88.5%**，需求覆盖率差 **0.0pp**
   - Pairwise 1胜/9负，但 raw-vs-raw 校准表明 Judge 存在"回答长度/细节"偏好，综合质量以相似度 + 覆盖率为准
@@ -58,6 +58,16 @@
 新的建议评测方式：20 轮以上、原始输入达到 15k+ token 后，再比较 4k/8k/12k 预算；默认关闭 semantic fold，分别运行 controlled replay 与 rollout。
 
 ### 2026-07-18 长上下文真实回归
+
+> ⚠️ **2026-10-07 全盘查证更正**：本段引用的报告 `reports/demo-eval-2026-07-18T04-12-29.md` 经 git 全历史 + Context.zip + 原始基线目录交叉查证**从未以文件形式存在**，下列数字（46.6% / 65.4% / 87.8% / -5.3pp / 0-18）不可溯源，**已作废**。
+>
+> 替代数据来自 2026-10-07 用当前代码（rotation 经济性门槛 + 自动硬约束 + 串行 Judge + 需求逐条核对 + 两次不一致判平）重跑的 20 轮受控回放，报告：`reports/_rerun-20t-baseline-20261007/demo-eval-2026-10-07T07-41-45.md`，可追溯、可复现：
+> - 累计输入 234031 → 139765（**-40.3%**）；末轮 27327 → 11298（**-58.7%**）
+> - 相似度 85.6%；需求覆盖率 0.0pp（100%→100%，零差异）；非劣率 90.0%（胜/平/负 2/7/1）
+> - 严重退化 0/10 有效（10 压缩轮）；输出截断 0/20
+> - 缓存命中：本地预估 直连 79.3% / 代理 67.7%；DeepSeek 真实 直连 98.3% / 代理 80.7%
+>
+> 以下为当时的原始工作记录，**数字仅供历史参考，不代表当前可追溯结论**。
 
 最终配置：DeepSeek `deepseek-chat`，20 轮 controlled replay，budget=8000，结构化摘要开启，semantic fold 关闭，回答上限 2200。
 
@@ -567,7 +577,7 @@ pnpm --filter @context/engine exec tsx src/__test__/benchmark.ts
 
 ### 当前待解决问题
 
-1. **Pairwise Judge 存在长度/细节偏好**：raw-vs-raw 校准显示同输入两次生成 Judge 仍强判胜负，导致 20 轮回归 Pairwise 1胜/9负，与实际语义（相似度 88.5%、覆盖率 0.0pp）不符。需要以相似度 + 覆盖率为主要质量结论
+1. **Pairwise Judge 偏差（已在 2026-10-07 修正口径）**：原口径下 raw-vs-raw 校准显示 Judge 存在长度偏好 + 决胜轮位置偏置，导致 20 轮回归 Pairwise 1胜/9负与实际语义不符。现已改为「需求逐条核对 + 位置交换，两次不一致直接判平」并删除有偏决胜轮，2026-10-07 重跑（`reports/_rerun-20t-baseline-20261007/`）非劣率 90.0%（胜/平/负 2/7/1），相似度 85.6%、需求覆盖率 0.0pp（零差异）
 2. **归档 epoch 切换导致 cache 全 miss**：Turn 13 归档后缓存命中从 ~99% 降至 0%，之后需 5-7 轮恢复。这正是 `rearchiveThreshold = hardLimit * 2` 的设计动机，但一次归档仍带来一次全 miss 的成本
 3. **budget=1500 准确率偏低（0%）**：清空式裁剪保留了缓存命中但丢失了上下文信息。已通过预算提高到 8000 + 归档系统缓解，但极端低预算下仍需权衡
 4. **judge 模型用同一模型**：被测和 judge 都用 deepseek-chat，存在自评偏差。理想情况 judge 应用 GPT-4，但 DeepSeek 便宜足够 demo
@@ -601,7 +611,7 @@ pnpm --filter @context/engine exec tsx src/__test__/benchmark.ts
 
 ## 十、简历叙事
 
-> "我开发了一个面向 AI Coding 的上下文管理代理。它通过 HTTP 代理层拦截 LLM 请求，在保证回答质量（Pairwise + 位置交换 + 第三轮决胜 + LLM 语义相似度评测）的前提下，两级压缩（可逆 + 预算裁剪）将 token 消耗降低 63%（多轮对话累计）至 75%（最后一轮），并实现了 cache_hit 预估、成本节省统计等可观测性能力。项目采用三层架构（核心库 + 代理 + MCP），支持 OpenAI / Anthropic 双协议，并提供了完整的 benchmark 评估（单轮基准 + 多轮端到端）。"
+> "我开发了一个面向 AI Coding 的上下文管理代理。它通过 HTTP 代理层拦截 LLM 请求，在保证回答质量（Pairwise + 需求逐条核对 + 位置交换、两次不一致判平 + LLM 语义相似度评测）的前提下，两级压缩（可逆 + 预算裁剪 + rotation 经济性门槛）将 token 消耗降低 40.3%（多轮对话累计）至 58.7%（最后一轮），并实现了 cache_hit 预估、成本节省统计等可观测性能力。项目采用三层架构（核心库 + 代理 + MCP），支持 OpenAI / Anthropic 双协议，并提供了完整的 benchmark 评估（单轮基准 + 多轮端到端）。"
 
 **可讲深的方向**：
 
